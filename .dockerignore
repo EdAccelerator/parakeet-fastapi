@@ -1,0 +1,24 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+*.egg-info/
+build/
+dist/
+.git/
+.gitignore
+.github/
+.idea/
+.vscode/
+tests/
+docker-compose.yml
+# Note: do NOT exclude README.md — it is referenced by pyproject.toml.
+.github/
+.idea/
+.vscode/

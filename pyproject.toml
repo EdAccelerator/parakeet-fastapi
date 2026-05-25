@@ -1,0 +1,51 @@
+[project]
+name = "parakeet-fastapi"
+version = "0.1.0"
+description = "Dockerized FastAPI wrapper of NVIDIA Parakeet TDT 0.6B v3 multilingual ASR (CPU/ONNX)."
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+license = { text = "Apache-2.0" }
+authors = [{ name = "parakeet-fastapi contributors" }]
+
+dependencies = [
+  "fastapi>=0.115,<0.120",
+  "uvicorn[standard]>=0.30,<0.40",
+  "python-multipart>=0.0.9",
+  "pydantic>=2.7,<3",
+  "pydantic-settings>=2.3,<3",
+  # onnx-asr with CPU runtime + HF Hub support.
+  # Note: onnxruntime 1.24.1 is known to be broken with onnx-asr — pin away from it.
+  "onnx-asr[cpu,hub]>=0.7,<0.12",
+  "onnxruntime>=1.20,!=1.24.1,<1.26",
+  "huggingface-hub>=0.24,<1.0",
+  "numpy>=1.22,<3",
+  "soundfile>=0.12,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "pytest-asyncio>=0.23",
+  "httpx>=0.27",
+  "requests>=2.31",
+]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]
+exclude = ["tests*", "scripts*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+  "slow: marks tests that load the real ONNX model (deselect with -m 'not slow')",
+  "docker: marks tests that require Docker (deselect with -m 'not docker')",
+]
+filterwarnings = [
+  "ignore::DeprecationWarning",
+]

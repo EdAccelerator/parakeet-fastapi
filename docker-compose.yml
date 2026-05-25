@@ -1,0 +1,29 @@
+services:
+  parakeet:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        PARAKEET_QUANTIZATION: int8
+    image: parakeet-fastapi:latest
+    container_name: parakeet-fastapi
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      LOG_LEVEL: INFO
+      ORT_INTRA_OP_THREADS: ""  # use container CPU count
+      INFERENCE_CONCURRENCY: "1"
+      MAX_AUDIO_SECONDS: "1800"
+    deploy:
+      resources:
+        limits:
+          memory: 4g
+        reservations:
+          memory: 2g
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 120s
+      retries: 5
