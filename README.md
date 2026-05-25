@@ -19,6 +19,14 @@ multilingual speech-to-text model. Inference runs on **CPU** via
 
 ## Quickstart (Docker)
 
+Pull the pre-built image from GitHub Container Registry:
+
+```sh
+docker run --rm -p 8000:8000 ghcr.io/edaccelerator/parakeet-fastapi:latest
+```
+
+Or build it yourself:
+
 ```sh
 docker build -t parakeet-fastapi:latest .
 docker run --rm -p 8000:8000 parakeet-fastapi:latest
@@ -232,6 +240,41 @@ PARAKEET_VAD_DIR=$PWD/models/silero-vad \
 pytest -m "not docker" -q
 ```
 
+## Container image
+
+Published to GitHub Container Registry by the
+[`Publish container image`](.github/workflows/publish-image.yml) workflow on
+every push to `main` and on version tags. Built for `linux/amd64` (the
+ECS Fargate default). To add `linux/arm64`, edit the `platforms:` input in
+the workflow.
+
+```
+ghcr.io/edaccelerator/parakeet-fastapi:latest          # tip of main
+ghcr.io/edaccelerator/parakeet-fastapi:main            # same
+ghcr.io/edaccelerator/parakeet-fastapi:sha-<short-sha> # exact commit
+ghcr.io/edaccelerator/parakeet-fastapi:v0.1.0          # version tag (when cut)
+ghcr.io/edaccelerator/parakeet-fastapi:0.1             # major.minor
+```
+
+The image is **public** once you flip the package visibility to public the
+first time (`Repo -> Packages -> parakeet-fastapi -> Package settings ->
+Change visibility -> Public`). Until then, pulls require a personal access
+token with `read:packages`:
+
+```sh
+echo "$GHCR_PAT" | docker login ghcr.io -u <your-user> --password-stdin
+docker pull ghcr.io/edaccelerator/parakeet-fastapi:latest
+```
+
+Each pushed image carries an
+[SLSA-3 provenance attestation](https://github.com/EdAccelerator/parakeet-fastapi/attestations)
+produced via `actions/attest-build-provenance`. Verify with:
+
+```sh
+gh attestation verify oci://ghcr.io/edaccelerator/parakeet-fastapi:latest \
+  --owner EdAccelerator
+```
+
 ## AWS ECS deployment
 
 The image is designed for **AWS ECS (Fargate or EC2)**:
@@ -257,7 +300,7 @@ Minimal task definition snippet:
   "memory": "4096",
   "containerDefinitions": [{
     "name": "parakeet",
-    "image": "<your-ecr>/parakeet-fastapi:latest",
+    "image": "ghcr.io/edaccelerator/parakeet-fastapi:latest",
     "portMappings": [{ "containerPort": 8000, "protocol": "tcp" }],
     "environment": [
       { "name": "LOG_LEVEL", "value": "INFO" },
