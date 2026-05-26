@@ -48,14 +48,31 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  # Lowercase the repo name so `EdAccelerator/parakeet-fastapi` -> `edaccelerator/parakeet-fastapi`
-  # (GHCR namespaces are lowercase).
-  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  image-name:
+    # Single source of truth for the lowercase `ghcr.io/<owner>/<repo>` string.
+    # `github.repository` keeps the original case from the repo settings
+    # (e.g. `EdAccelerator/parakeet-fastapi`), but GHCR namespaces must be
+    # lowercase. We lowercase once here and pass the canonical reference
+    # down via job outputs so no downstream job has to remember this rule.
+    name: Compute lowercase image name
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.compute.outputs.image }}
+    steps:
+      - id: compute
+        env:
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          lower=$(printf '%s' "$REPOSITORY" | tr '[:upper:]' '[:lower:]')
+          echo "image=${REGISTRY}/${lower}" >> "$GITHUB_OUTPUT"
+
   build:
     name: Build (${{ matrix.platform }})
     runs-on: ${{ matrix.runner }}
+    needs:
+      - image-name
     strategy:
       fail-fast: false
       matrix:
@@ -109,7 +126,9 @@ jobs:
           # `images:` is the canonical target on GHCR. We only consume
           # the `labels` output here — tags are computed by the merge
           # job below since this job pushes by digest, not by tag.
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # metadata-action lowercases this internally; we pass the
+          # already-lowercased value for symmetry with the push target.
+          images: ${{ needs.image-name.outputs.image }}
           labels: |
             org.opencontainers.image.title=parakeet-fastapi
             org.opencontainers.image.description=Stateless FastAPI wrapper around NVIDIA Parakeet TDT 0.6B v3 multilingual ASR (CPU/ONNX).
@@ -125,7 +144,7 @@ jobs:
           # Push by digest only. The merge job creates the human-readable
           # tags as a manifest list pointing at these digests.
           outputs: |
-            type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}
+            type=image,name=${{ needs.image-name.outputs.image }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}
           labels: ${{ steps.meta.outputs.labels }}
           # Per-arch GHA cache scopes — sharing a single scope would
           # cause the two jobs to clobber each other's layers.
@@ -157,6 +176,7 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name != 'pull_request'
     needs:
+      - image-name
       - build
 
     permissions:
@@ -189,7 +209,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ${{ needs.image-name.outputs.image }}
           tags: |
             type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
             type=ref,event=branch
@@ -215,7 +235,7 @@ jobs:
         working-directory: /tmp/digests
         env:
           DOCKER_METADATA_OUTPUT_JSON: ${{ steps.meta.outputs.json }}
-          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          IMAGE: ${{ needs.image-name.outputs.image }}
         run: |
           mapfile -t tag_args < <(jq -r '.tags[] | "-t\n" + .' <<< "$DOCKER_METADATA_OUTPUT_JSON")
           mapfile -t digest_args < <(printf '%s\n' * | sed "s|^|${IMAGE}@sha256:|")
@@ -226,16 +246,19 @@ jobs:
         # we just pushed — that's what provenance has to attest to so
         # downstream `gh attestation verify` works against any tag.
         id: inspect
+        env:
+          IMAGE: ${{ needs.image-name.outputs.image }}
+          VERSION: ${{ steps.meta.outputs.version }}
         run: |
           digest=$(docker buildx imagetools inspect \
-            "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}" \
+            "${IMAGE}:${VERSION}" \
             --format '{{ json .Manifest }}' | jq -r '.digest')
           echo "digest=${digest}" >> "$GITHUB_OUTPUT"
 
       - name: Attest provenance for manifest
         uses: actions/attest-build-provenance@v2
         with:
-          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-name: ${{ needs.image-name.outputs.image }}
           subject-digest: ${{ steps.inspect.outputs.digest }}
           push-to-registry: true
 
