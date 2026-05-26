@@ -244,9 +244,14 @@ pytest -m "not docker" -q
 
 Published to GitHub Container Registry by the
 [`Publish container image`](.github/workflows/publish-image.yml) workflow on
-every push to `main` and on version tags. Built for `linux/amd64` (the
-ECS Fargate default). To add `linux/arm64`, edit the `platforms:` input in
-the workflow.
+every push to `main` and on version tags. Built as a multi-arch manifest
+for both `linux/amd64` (ECS Fargate, most cloud VMs, classic CI) and
+`linux/arm64` (AWS Graviton, Apple Silicon developer laptops, Raspberry
+Pi 4/5). Each arch is built on its own native GitHub-hosted runner —
+`ubuntu-latest` for amd64 and `ubuntu-24.04-arm` for arm64 — so neither
+build pays the QEMU emulation tax. The two single-arch images are
+stitched into a manifest list at the end of the workflow, so a single
+pull resolves to the right binary automatically.
 
 ```
 ghcr.io/edaccelerator/parakeet-fastapi:latest          # tip of main
@@ -288,6 +293,12 @@ The image is designed for **AWS ECS (Fargate or EC2)**:
   ORT session already saturates the available cores.
 - **Health check:** point the ALB/target-group health check at `/health`
   with a `start_period` of ≥ 90 s.
+- **Architecture:** the published image is multi-arch (linux/amd64 +
+  linux/arm64), so the same tag works on standard Fargate (amd64) and
+  Fargate on AWS Graviton (arm64). Graviton is generally ~20% cheaper
+  per vCPU-hour at comparable performance for ONNX int8 inference; set
+  `"runtimePlatform": {"cpuArchitecture": "ARM64", "operatingSystemFamily":
+  "LINUX"}` in the task definition to opt in.
 
 Minimal task definition snippet:
 
