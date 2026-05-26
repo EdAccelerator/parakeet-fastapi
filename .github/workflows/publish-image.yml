@@ -10,12 +10,33 @@ name: Publish container image
 #   - pull request        ->  :pr-<n>     (NOT pushed; build-only smoke test)
 #   - manual dispatch     ->  :main, :latest
 #
-# The workflow builds `linux/amd64` only by default. To also build arm64,
-# add `linux/arm64` to the `platforms:` input below. arm64 builds run under
-# QEMU emulation on amd64 runners, which combined with the baked-in 670 MB
-# model layer and a fresh onnxruntime install pushes total build time past
-# the free-tier 6-hour job limit on many runs. Switch to a native arm64
-# runner (e.g. `ubuntu-24.04-arm`) if you need multi-arch.
+# Multi-arch (linux/amd64 + linux/arm64):
+#
+#   The image is built for both architectures, each on its own native
+#   runner — `ubuntu-latest` for amd64 (the default and what ECS Fargate
+#   runs) and `ubuntu-24.04-arm` for arm64 (which Apple Silicon
+#   developers, AWS Graviton hosts, and Raspberry Pi 4/5 boards
+#   actually execute natively). Native runners avoid the QEMU
+#   emulation overhead that would otherwise push the build past the
+#   free-tier 6-hour job limit, since the model layer is large
+#   (~670 MB) and onnxruntime is heavy to install under translation.
+#
+# Pipeline shape (canonical Docker multi-arch pattern):
+#
+#   1. `build` matrix job — builds each platform on its native runner
+#      and pushes a digest-only image (no tag) to GHCR. Digests are
+#      written to `/tmp/digests/<arch>` and uploaded as an artifact so
+#      the merge step can reach across jobs.
+#   2. `merge` job — downloads the digests, runs `docker buildx
+#      imagetools create` to assemble a multi-arch manifest list
+#      under all the tags from `docker/metadata-action`, and attests
+#      provenance against the final manifest digest.
+#
+#   Why the digest fan-out instead of one job with `platforms:
+#   linux/amd64,linux/arm64`: a single-job build can only run on one
+#   runner, so it must pick one arch to be native and emulate the
+#   other under QEMU — defeating the purpose of having both runner
+#   types available.
 
 on:
   push:
@@ -32,9 +53,21 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  build-and-push:
-    name: Build & push multi-arch image
-    runs-on: ubuntu-latest
+  build:
+    name: Build (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            # Sanitized arch name used as the artifact key — '/' is not
+            # a legal character in artifact names.
+            arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
 
     permissions:
       contents: read
@@ -49,8 +82,10 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Free up disk space
-        # The model layer is large; default GH runners have ~14GB free which
-        # can be tight when caching multi-arch builds. Trim some defaults.
+        # The model layer is large; default GH runners have ~14GB free
+        # which can be tight even on a per-arch build with caching.
+        # Trim some defaults that the runner ships with but we don't
+        # need.
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
                        /opt/hostedtoolcache/CodeQL || true
@@ -67,7 +102,90 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Compute image tags + labels
+      - name: Compute image labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          # `images:` is the canonical target on GHCR. We only consume
+          # the `labels` output here — tags are computed by the merge
+          # job below since this job pushes by digest, not by tag.
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          labels: |
+            org.opencontainers.image.title=parakeet-fastapi
+            org.opencontainers.image.description=Stateless FastAPI wrapper around NVIDIA Parakeet TDT 0.6B v3 multilingual ASR (CPU/ONNX).
+            org.opencontainers.image.licenses=Apache-2.0
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ matrix.platform }}
+          # Push by digest only. The merge job creates the human-readable
+          # tags as a manifest list pointing at these digests.
+          outputs: |
+            type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Per-arch GHA cache scopes — sharing a single scope would
+          # cause the two jobs to clobber each other's layers.
+          cache-from: type=gha,scope=build-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=build-${{ matrix.arch }}
+          provenance: true
+          sbom: true
+
+      - name: Export digest
+        # Write the digest to a per-arch file under /tmp/digests/, which
+        # gets uploaded as an artifact for the merge job to consume.
+        if: github.event_name != 'pull_request'
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Merge multi-arch manifest
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    needs:
+      - build
+
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          # Glob across both per-arch artifacts; their per-platform
+          # digest files are flattened together.
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tags
         id: meta
         uses: docker/metadata-action@v5
         with:
@@ -75,44 +193,65 @@ jobs:
           tags: |
             type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
             type=ref,event=branch
-            type=ref,event=pr
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
             type=sha,format=short,prefix=sha-
-          labels: |
-            org.opencontainers.image.title=parakeet-fastapi
-            org.opencontainers.image.description=Stateless FastAPI wrapper around NVIDIA Parakeet TDT 0.6B v3 multilingual ASR (CPU/ONNX).
-            org.opencontainers.image.licenses=Apache-2.0
 
-      - name: Build and push
-        id: build
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./Dockerfile
-          platforms: linux/amd64
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          provenance: true
-          sbom: true
+      - name: Create manifest list and push
+        # `imagetools create` takes the per-arch digests pushed by the
+        # build jobs and stitches them into one manifest list per tag.
+        # The result is what consumers see when they pull
+        # `ghcr.io/edaccelerator/parakeet-fastapi:<tag>` — the docker
+        # client picks the right arch automatically.
+        #
+        # The argv is built up by reading the tag list out of the
+        # metadata-action's JSON output and combining it with the
+        # digest files dropped by the matrix build. We use `mapfile`
+        # to materialize each tag and each digest as its own array
+        # element (one `-t` flag per tag, one positional arg per
+        # digest), which keeps tags that happen to contain shell
+        # metacharacters safe.
+        working-directory: /tmp/digests
+        env:
+          DOCKER_METADATA_OUTPUT_JSON: ${{ steps.meta.outputs.json }}
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        run: |
+          mapfile -t tag_args < <(jq -r '.tags[] | "-t\n" + .' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          mapfile -t digest_args < <(printf '%s\n' * | sed "s|^|${IMAGE}@sha256:|")
+          docker buildx imagetools create "${tag_args[@]}" "${digest_args[@]}"
 
-      - name: Attest provenance for pushed image
-        if: github.event_name != 'pull_request'
+      - name: Resolve final manifest digest
+        # `imagetools inspect` returns the digest of the manifest list
+        # we just pushed — that's what provenance has to attest to so
+        # downstream `gh attestation verify` works against any tag.
+        id: inspect
+        run: |
+          digest=$(docker buildx imagetools inspect \
+            "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}" \
+            --format '{{ json .Manifest }}' | jq -r '.digest')
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Attest provenance for manifest
         uses: actions/attest-build-provenance@v2
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          subject-digest: ${{ steps.build.outputs.digest }}
+          subject-digest: ${{ steps.inspect.outputs.digest }}
           push-to-registry: true
 
       - name: Summary
-        if: github.event_name != 'pull_request'
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          DIGEST: ${{ steps.inspect.outputs.digest }}
         run: |
-          echo "### Published image" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          echo "${{ steps.meta.outputs.tags }}" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          echo "Digest: \`${{ steps.build.outputs.digest }}\`" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### Published multi-arch image"
+            echo ""
+            echo "Platforms: linux/amd64 + linux/arm64"
+            echo ""
+            echo "Tags:"
+            echo '```'
+            echo "$TAGS"
+            echo '```'
+            echo "Manifest digest: \`$DIGEST\`"
+          } >> "$GITHUB_STEP_SUMMARY"
